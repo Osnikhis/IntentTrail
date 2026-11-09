@@ -38,7 +38,19 @@ MESSAGE_STOPWORDS = {
     "fix", "fixed", "for", "from", "into", "make", "more", "new", "not", "our",
     "refactor", "remove", "removed", "test", "tests", "the", "this", "through", "to",
     "update", "updated", "using", "with",
+    "initial", "intenttrial", "intenttrail", "added",
 }
+
+# Generated / environment paths are not project work. They are excluded from
+# theme grouping and marker scanning, but their commits stay listed for audit.
+GENERATED_DIRS = {".venv", "venv", "site-packages", "__pycache__", "node_modules"}
+GENERATED_SUFFIXES = (".pyc", ".pyo", ".pyd")
+ENVIRONMENT_HEAVY_RATIO = 0.5
+
+
+def is_generated_path(path):
+    p = (path or "").replace("\\", "/").lower()
+    return any(part in GENERATED_DIRS for part in p.split("/")[:-1]) or p.endswith(GENERATED_SUFFIXES)
 
 
 def parse_repo_url(url):
@@ -142,8 +154,11 @@ def _enrich_commit(owner, repo, commit):
     detail = api_get(f"/repos/{owner}/{repo}/commits/{sha}")
     detail_commit = detail.get("commit") or {}
     detail_files = detail.get("files") or []
-    filenames = [file.get("filename") for file in detail_files if file.get("filename")]
-    markers, patch_count, patch_chars, patch_truncated = _scan_patch_files(detail_files)
+    all_filenames = [file.get("filename") for file in detail_files if file.get("filename")]
+    filenames = [name for name in all_filenames if not is_generated_path(name)]
+    generated_count = len(all_filenames) - len(filenames)
+    analysis_files = [f for f in detail_files if not is_generated_path(f.get("filename"))]
+    markers, patch_count, patch_chars, patch_truncated = _scan_patch_files(analysis_files)
     stats = detail.get("stats") or {}
     return {
         "sha": sha,
@@ -152,7 +167,10 @@ def _enrich_commit(owner, repo, commit):
         "date": _commit_date(detail) or _commit_date(commit),
         "url": detail.get("html_url") or commit.get("html_url") or "",
         "filenames": filenames[:MAX_FILES_PER_COMMIT],
-        "file_count": len(filenames),
+        "file_count": len(all_filenames),
+        "generated_file_count": generated_count,
+        "environment_heavy": bool(all_filenames)
+        and generated_count / len(all_filenames) >= ENVIRONMENT_HEAVY_RATIO,
         "filenames_truncated": len(filenames) > MAX_FILES_PER_COMMIT,
         "additions": stats.get("additions"),
         "deletions": stats.get("deletions"),
@@ -178,6 +196,8 @@ def _summary_commit(commit, owner, repo, error):
         "url": url,
         "filenames": [],
         "file_count": None,
+        "generated_file_count": 0,
+        "environment_heavy": False,
         "filenames_truncated": False,
         "additions": None,
         "deletions": None,
@@ -238,10 +258,16 @@ def _message_keywords(message):
 
 
 def group_related_commits(commits):
-    """Return connected groups, with the exact transparent rules that joined them."""
+    """Return connected groups, with the exact transparent rules that joined them.
+
+    Environment-heavy commits (mostly .venv / site-packages / cache files) are
+    skipped: dependency files are not evidence of project work.
+    """
     links = []
     for left_index in range(len(commits)):
         left = commits[left_index]
+        if left.get("environment_heavy"):
+            continue
         left_files = set(left.get("filenames") or [])
         left_dirs = {
             PurePosixPath(path).parent.as_posix()
@@ -251,6 +277,8 @@ def group_related_commits(commits):
         left_keywords = _message_keywords(left.get("message", ""))
         for right_index in range(left_index + 1, len(commits)):
             right = commits[right_index]
+            if right.get("environment_heavy"):
+                continue
             right_files = set(right.get("filenames") or [])
             right_dirs = {
                 PurePosixPath(path).parent.as_posix()
@@ -421,7 +449,8 @@ def report(meta, findings, commits):
         f"- Description: {_markdown_text(meta.get('description') or 'Not provided')}",
         f"- Default branch: {_markdown_text(meta.get('default_branch', 'Unknown'))}",
         f"- Commits with summaries retrieved: {len(commits)}",
-        f"- Commits with details retrieved: {sum(bool(commit.get('detail_available')) for commit in commits)}", "",
+        f"- Commits with details retrieved: {sum(bool(commit.get('detail_available')) for commit in commits)}",
+        f"- Commits excluded as generated/environment-heavy: {sum(bool(commit.get('environment_heavy')) for commit in commits)}", "",
         "## Potential unfinished work and work themes", "",
     ]
     for index, finding in enumerate(findings, 1):
@@ -469,11 +498,16 @@ def report(meta, findings, commits):
                 + (" (scan truncated)." if commit["patch_truncated"] else "."),
                 "- Raw patch text is not included in this report.",
             ]
+            if commit.get("environment_heavy"):
+                lines.append(
+                    f"- Excluded from work-theme analysis: {commit.get('generated_file_count', 0)} of "
+                    f"{commit['file_count']} files are generated/environment files."
+                )
             if commit["filenames"]:
                 lines.append("- Filenames:")
                 lines.extend(f"  - `{_markdown_text(filename)}`" for filename in commit["filenames"])
             if commit["filenames_truncated"]:
-                lines.append(f"  - Additional filenames omitted (showing {MAX_FILES_PER_COMMIT} of {commit['file_count']}).")
+                lines.append(f"  - Additional filenames omitted (showing {len(commit['filenames'])} analyzed files).")
             lines.append(
                 "- Added-line markers: " + (", ".join(commit["patch_markers"]) if commit["patch_markers"] else "None detected")
             )
@@ -488,6 +522,7 @@ def report(meta, findings, commits):
         "- Binary or large files may not include patch data, and GitHub limits the files returned for a commit.",
         "- GitHub API failures or rate limits can leave a commit summary without detail; unavailable details are identified above.",
         "- Grouping uses shared filenames, parent directories, and non-generic message keywords; groups are clues, not verified themes.",
+        "- Generated and environment paths (.venv, venv, site-packages, __pycache__, .pyc) are excluded from theme grouping and marker scanning; those commits stay listed for auditability.",
         "- This version uses transparent rules, not a trained ML model.",
         "- Only up to 100 issues and 100 pull requests are retrieved from their respective endpoints.",
         "- A human maintainer should verify every finding before sharing this handover.",
@@ -543,9 +578,14 @@ def _render_commit(commit):
             st.write("**Changed filenames:**")
             for filename in commit["filenames"]:
                 st.code(filename, language=None)
+        if commit.get("environment_heavy"):
+            st.warning(
+                f"Excluded from work-theme analysis: {commit.get('generated_file_count', 0)} of "
+                f"{commit['file_count']} files are generated/environment files."
+            )
         if commit["filenames_truncated"]:
             st.caption(
-                f"Showing {MAX_FILES_PER_COMMIT} of {commit['file_count']} filenames returned by GitHub."
+                f"Showing {len(commit['filenames'])} analyzed filenames; additional filenames omitted."
             )
         if commit["patch_markers"]:
             st.write("**Added-line markers:**", ", ".join(commit["patch_markers"]))
@@ -627,6 +667,10 @@ def render_app():
                 "Files": commit["file_count"] if commit["detail_available"] else "Unavailable",
                 "Additions": commit["additions"] if commit["detail_available"] else "Unavailable",
                 "Deletions": commit["deletions"] if commit["detail_available"] else "Unavailable",
+                "Analysis": (
+                    "Excluded (generated files)" if commit.get("environment_heavy")
+                    else "Included"
+                ) if commit["detail_available"] else "Unavailable",
                 "Patch": (
                     "Available" if commit["patch_count"] and not commit["patch_truncated"]
                     else "Limited" if commit["patch_count"]

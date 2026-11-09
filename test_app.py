@@ -165,5 +165,67 @@ class SignalTests(unittest.TestCase):
         self.assertNotIn("TOPSECRET_VALUE", report)
 
 
+class GeneratedFileFilteringTests(unittest.TestCase):
+    def test_generated_paths_are_detected(self):
+        self.assertTrue(app.is_generated_path(".venv/Lib/site-packages/PIL/Image.py"))
+        self.assertTrue(app.is_generated_path("pkg/__pycache__/module.cpython-311.pyc"))
+        self.assertTrue(app.is_generated_path("venv\\Lib\\site-packages\\x.py"))
+        self.assertFalse(app.is_generated_path("app.py"))
+        self.assertFalse(app.is_generated_path(".gitignore"))
+        self.assertFalse(app.is_generated_path("src/auth/login.py"))
+
+    def test_environment_heavy_commit_is_flagged_and_not_scanned(self):
+        files = [
+            {"filename": f".venv/Lib/site-packages/PIL/m{i}.py", "patch": "+TODO"}
+            for i in range(9)
+        ]
+        files.append({"filename": ".gitignore", "patch": "+.venv/"})
+        detail = {
+            "commit": {"message": "Initial MVP"},
+            "files": files,
+            "stats": {"additions": 10, "deletions": 0},
+            "html_url": "https://github.com/acme/demo/commit/abc123",
+        }
+        with patch("app.api_get", return_value=detail):
+            commit = app._enrich_commit("acme", "demo", {"sha": "abc123"})
+
+        self.assertTrue(commit["environment_heavy"])
+        self.assertEqual(commit["file_count"], 10)
+        self.assertEqual(commit["generated_file_count"], 9)
+        self.assertEqual(commit["filenames"], [".gitignore"])
+        self.assertEqual(commit["patch_markers"], [])
+
+    def test_environment_heavy_commits_are_not_grouped(self):
+        first = {"sha": "1", "message": "Initial MVP", "filenames": [".gitignore"], "environment_heavy": True}
+        second = {"sha": "2", "message": "Remove environment", "filenames": [".gitignore"], "environment_heavy": True}
+
+        self.assertEqual(app.group_related_commits([first, second]), [])
+
+    def test_report_lists_excluded_commit_for_auditability(self):
+        commit = {
+            "message": "Initial MVP",
+            "author": "Ada",
+            "date": "2026-01-02T03:04:05Z",
+            "url": "https://github.com/acme/demo/commit/abc123",
+            "filenames": [".gitignore"],
+            "patch_markers": [],
+            "detail_available": True,
+            "environment_heavy": True,
+            "generated_file_count": 9,
+            "file_count": 10,
+            "filenames_truncated": False,
+            "additions": 10,
+            "deletions": 0,
+            "patch_count": 1,
+            "patch_chars_scanned": 7,
+            "patch_truncated": False,
+        }
+
+        report = app.report({"full_name": "acme/demo"}, [], [commit])
+
+        self.assertIn("Initial MVP", report)
+        self.assertIn("Excluded from work-theme analysis", report)
+
+
 if __name__ == "__main__":
     unittest.main()
