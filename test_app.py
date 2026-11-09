@@ -1,0 +1,169 @@
+import unittest
+from unittest.mock import patch
+
+import app
+
+
+class CommitExtractionTests(unittest.TestCase):
+    def test_api_get_recognizes_secondary_rate_limit(self):
+        response = app.requests.Response()
+        response.status_code = 403
+        response.headers["X-RateLimit-Remaining"] = "10"
+        response._content = b'{"message":"You have exceeded a secondary rate limit."}'
+        with patch("app.requests.get", return_value=response):
+            with self.assertRaisesRegex(RuntimeError, "rate limit"):
+                app.api_get("/repos/acme/demo")
+
+    def test_fetch_extracts_commit_details_without_retaining_patch_text(self):
+        summary = {
+            "sha": "abc123",
+            "html_url": "https://github.com/acme/demo/commit/abc123",
+            "commit": {
+                "message": "WIP: finish login",
+                "author": {"name": "Ada", "date": "2026-01-02T03:04:05Z"},
+            },
+        }
+        detail = {
+            "sha": "abc123",
+            "html_url": summary["html_url"],
+            "author": {"login": "ada"},
+            "commit": {
+                "message": "WIP: finish login",
+                "author": {"name": "Ada", "date": "2026-01-02T03:04:05Z"},
+            },
+            "stats": {"additions": 4, "deletions": 2},
+            "files": [{
+                "filename": "src/login.py",
+                "patch": "@@ -1 +1 @@\n+ # TODO: TOPSECRET_VALUE",
+            }],
+        }
+        with patch("app.api_get", side_effect=[
+            {"full_name": "acme/demo"},
+            [summary],
+            [],
+            [],
+            detail,
+        ]) as api_call:
+            meta, commits, issues, pulls = app.fetch("acme", "demo")
+
+        self.assertEqual(meta["full_name"], "acme/demo")
+        self.assertEqual((len(issues), len(pulls)), (0, 0))
+        self.assertEqual(api_call.call_args_list[1].args[0], "/repos/acme/demo/commits")
+        self.assertEqual(commits[0]["author"], "ada")
+        self.assertEqual(commits[0]["filenames"], ["src/login.py"])
+        self.assertEqual((commits[0]["additions"], commits[0]["deletions"]), (4, 2))
+        self.assertEqual(commits[0]["patch_markers"], ["TODO"])
+        self.assertNotIn("TOPSECRET_VALUE", repr(commits[0]))
+
+    def test_diff_scan_is_bounded_and_reports_truncation(self):
+        files = [{
+            "filename": "large.py",
+            "patch": "+" + ("a" * app.MAX_DIFF_CHARS_PER_COMMIT) + "\n+TODO",
+        }]
+
+        markers, patch_count, scanned, truncated = app._scan_patch_files(files)
+
+        self.assertEqual(patch_count, 1)
+        self.assertEqual(scanned, app.MAX_DIFF_CHARS_PER_COMMIT)
+        self.assertTrue(truncated)
+        self.assertEqual(markers, [])
+
+    def test_missing_patch_is_reported_without_failure(self):
+        self.assertEqual(app._scan_patch_files([{"filename": "image.png"}]), ([], 0, 0, False))
+
+    def test_rate_limit_keeps_commit_summary_and_marks_following_details_unavailable(self):
+        summaries = [
+            {"sha": "one", "commit": {"message": "First"}},
+            {"sha": "two", "commit": {"message": "Second"}},
+        ]
+        with patch("app.api_get", side_effect=[
+            {"full_name": "acme/demo"},
+            summaries,
+            [],
+            [],
+            RuntimeError("GitHub API rate limit reached. Wait and try again."),
+        ]):
+            _, commits, _, _ = app.fetch("acme", "demo")
+
+        self.assertEqual([commit["message"] for commit in commits], ["First", "Second"])
+        self.assertTrue(all(not commit["detail_available"] for commit in commits))
+        self.assertIn("rate limit", commits[0]["detail_error"].lower())
+        self.assertIn("rate limit", commits[1]["detail_error"].lower())
+
+    def test_server_error_on_one_commit_does_not_hide_other_details(self):
+        response = app.requests.Response()
+        response.status_code = 500
+        server_error = app.requests.exceptions.HTTPError("server error", response=response)
+        summaries = [
+            {"sha": "one", "commit": {"message": "First"}},
+            {"sha": "two", "commit": {"message": "Second"}},
+        ]
+        detail = {
+            "sha": "two",
+            "commit": {"message": "Second", "author": {"name": "Ada"}},
+            "stats": {"additions": 1, "deletions": 0},
+            "files": [],
+        }
+        with patch("app.api_get", side_effect=[
+            {"full_name": "acme/demo"},
+            summaries,
+            [],
+            [],
+            server_error,
+            detail,
+        ]):
+            _, commits, _, _ = app.fetch("acme", "demo")
+
+        self.assertFalse(commits[0]["detail_available"])
+        self.assertIn("HTTP 500", commits[0]["detail_error"])
+        self.assertTrue(commits[1]["detail_available"])
+
+
+class SignalTests(unittest.TestCase):
+    def test_related_commits_are_grouped_with_explainable_reason(self):
+        commits = [
+            {"message": "Add login validation", "filenames": ["src/auth/login.py"]},
+            {"message": "Improve login handling", "filenames": ["src/auth/login.py"]},
+            {"message": "Update unrelated docs", "filenames": ["docs/guide.md"]},
+        ]
+
+        groups = app.group_related_commits(commits)
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(groups[0]["commits"]), 2)
+        self.assertTrue(any("shared filename" in reason for reason in groups[0]["reasons"]))
+
+    def test_commit_signal_includes_evidence_and_report_excludes_diff_text(self):
+        commit = {
+            "message": "WIP: finish login",
+            "author": "Ada",
+            "date": "2026-01-02T03:04:05Z",
+            "url": "https://github.com/acme/demo/commit/abc123",
+            "filenames": ["src/login.py"],
+            "patch_markers": ["TODO"],
+            "detail_available": True,
+            "file_count": 1,
+            "filenames_truncated": False,
+            "additions": 1,
+            "deletions": 0,
+            "patch_count": 1,
+            "patch_chars_scanned": 18,
+            "patch_truncated": False,
+        }
+
+        findings = app.analyze([], [], [commit])
+        report = app.report({"full_name": "acme/demo"}, findings, [commit])
+
+        signal = next(item for item in findings if item["kind"] == "Possible unfinished work")
+        self.assertEqual(signal["commit_messages"], ["WIP: finish login"])
+        self.assertEqual(signal["filenames"], ["src/login.py"])
+        self.assertEqual(signal["commit_urls"], [commit["url"]])
+        self.assertIn("human maintainer must verify", signal["disclaimer"])
+        self.assertIn("Supporting commit messages", report)
+        self.assertIn(commit["url"], report)
+        self.assertIn("Raw patch text is not included", report)
+        self.assertNotIn("TOPSECRET_VALUE", report)
+
+
+if __name__ == "__main__":
+    unittest.main()
