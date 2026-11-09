@@ -1,1 +1,8 @@
-.venv/\n__pycache__/\n*.pyc\n.streamlit/secrets.toml\n.env\n
+.venv/
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+.env\n
+# Jupyter and IDE files
+.ipynb_checkpoints/
+.vscode/
