@@ -1,3 +1,5 @@
+import hashlib
+import os
 import re
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
@@ -6,6 +8,8 @@ from urllib.parse import urlparse
 import pandas as pd
 import requests
 import streamlit as st
+
+import round3_engine
 
 API = "https://api.github.com"
 HEADERS = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
@@ -595,6 +599,201 @@ def _render_commit(commit):
         st.markdown(f"[Open commit on GitHub]({commit['url']})")
 
 
+
+def _build_round3_context(meta, commits, issues, pulls):
+    """Build the evidence graph and bounded model payload for one repository run."""
+    graph = round3_engine.build_relationship_graph(commits, issues, pulls)
+    payload = round3_engine.build_intent_payload(
+        meta.get("full_name", ""), commits, issues, pulls, graph=graph
+    )
+    return graph, payload
+
+
+def _hypothesis_to_finding(hypothesis):
+    """Adapt a validated model hypothesis to the shared human-review format."""
+    return {
+        "kind": "AI-generated hypothesis",
+        "title": hypothesis.get("title") or "Possible work theme",
+        "body": hypothesis.get("summary", ""),
+        "summary": hypothesis.get("summary", ""),
+        "date": "—",
+        "url": "",
+        "why": "Suggested by Groq using the evidence references listed below.",
+        "commit_messages": [],
+        "filenames": [],
+        "commit_urls": [],
+        "evidence_refs": hypothesis.get("evidence_refs", []),
+        "suggested_next_steps": hypothesis.get("suggested_next_steps", []),
+        "disclaimer": hypothesis.get("human_review", HUMAN_REVIEW),
+    }
+
+
+def _append_review_items(existing, findings):
+    """Append new review items without resetting earlier human decisions."""
+    items = list(existing or [])
+    for finding in findings:
+        item = round3_engine.make_review_items([finding])[0]
+        seed = f"{len(items)}|{item['review_id']}|{finding.get('title', '')}"
+        item["review_id"] = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:12]
+        items.append(item)
+    return items
+
+
+def _render_relationship_graph(graph):
+    """Render evidence-backed repository associations as a graph and detail table."""
+    import hashlib
+    import json
+
+    nodes = graph.get("nodes", [])
+    edges = graph.get("edges", [])
+    st.subheader("Project relationships")
+    st.caption(
+        "Connections are evidence-backed associations (shared files, directories, keywords, "
+        "or explicit GitHub references), not verified technical dependencies."
+    )
+    left, right = st.columns(2)
+    left.metric("Evidence nodes", len(nodes))
+    right.metric("Relationships", len(edges))
+
+    if nodes and edges:
+        # Stable opaque DOT identifiers prevent repository text from becoming graph syntax.
+        dot_ids = {
+            node.get("id", ""): "n" + hashlib.sha1(str(node.get("id", "")).encode("utf-8")).hexdigest()[:12]
+            for node in nodes
+        }
+        type_styles = {
+            "commit": ("#DCEBFF", "#2563EB"),
+            "issue": ("#DCFCE7", "#15803D"),
+            "pull_request": ("#F3E8FF", "#7E22CE"),
+        }
+        lines = [
+            "digraph IntentTrail {",
+            '  graph [rankdir="LR", bgcolor="transparent", pad="0.25", nodesep="0.45", ranksep="0.8", overlap=false, splines=true];',
+            '  node [shape="box", style="rounded,filled", fontname="Arial", fontsize="10", margin="0.14,0.09"];',
+            '  edge [fontname="Arial", fontsize="8", color="#64748B", fontcolor="#475569", arrowsize="0.7"];',
+        ]
+        for node in nodes:
+            node_id = node.get("id", "")
+            if not node_id:
+                continue
+            label = f"{node.get('type', 'item').replace('_', ' ').title()}\n{node.get('label') or node_id}"
+            fill, stroke = type_styles.get(node.get("type"), ("#F1F5F9", "#64748B"))
+            lines.append(
+                f"  {dot_ids[node_id]} [label={json.dumps(label)}, fillcolor={json.dumps(fill)}, "
+                f"color={json.dumps(stroke)}, fontcolor={json.dumps('#0F172A')}];"
+            )
+        for edge in edges:
+            source = dot_ids.get(edge.get("source"))
+            target = dot_ids.get(edge.get("target"))
+            if not source or not target:
+                continue
+            edge_label = edge.get("type", "related").replace("_", " ")
+            evidence = ", ".join(edge.get("evidence", [])[:3])
+            tooltip = edge.get("reason", "")
+            if evidence:
+                tooltip = f"{tooltip} Evidence: {evidence}"
+            lines.append(
+                f"  {source} -> {target} [label={json.dumps(edge_label)}, tooltip={json.dumps(tooltip)}];"
+            )
+        lines.append("}")
+        st.graphviz_chart("\n".join(lines), use_container_width=True)
+        rows = []
+        labels = {node.get("id"): f"{node.get('type', 'item')}: {node.get('label', node.get('id'))}" for node in nodes}
+        for edge in edges:
+            rows.append({
+                "From": labels.get(edge.get("source"), edge.get("source", "")),
+                "Relationship": edge.get("type", ""),
+                "To": labels.get(edge.get("target"), edge.get("target", "")),
+                "Evidence": ", ".join(edge.get("evidence", [])),
+                "Why connected": edge.get("reason", ""),
+            })
+        with st.expander("Inspect relationship evidence", expanded=False):
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    elif nodes:
+        st.info("Evidence records were found, but no relationships connected them in this retrieval window.")
+        st.caption("No lines are drawn because the engine did not find evidence for a connection.")
+        st.dataframe(pd.DataFrame([
+            {"Type": n.get("type", "item"), "Record": n.get("label", n.get("id", "")), "Source": n.get("url", "")}
+            for n in nodes
+        ]), use_container_width=True, hide_index=True)
+    else:
+        st.info("No relationship records were found in the retrieved data. This does not mean no dependencies exist.")
+
+    for limitation in graph.get("limitations", []):
+        st.caption(f"Limitation: {limitation}")
+
+
+def _render_human_review(meta, commits, graph, issues=None, pulls=None):
+    review_items = st.session_state.get("review_items", [])
+    st.subheader("Human review and role-specific handover")
+    st.caption("Only findings you explicitly approve are included in role-specific handover exports.")
+    if not review_items:
+        st.info("There are no findings to review yet.")
+        return
+
+    labels = [
+        f"[{item.get('status', 'pending').upper()}] {item.get('edited_title') or item['original'].get('title', 'Untitled')}"
+        for item in review_items
+    ]
+    selected_index = st.selectbox(
+        "Choose a finding to review", range(len(review_items)),
+        format_func=lambda index: labels[index], key="review_selection",
+    )
+    selected = review_items[selected_index]
+    original = selected.get("original", {})
+    st.write(original.get("body") or original.get("summary") or original.get("why", "No summary provided."))
+    if original.get("evidence_refs"):
+        st.write("**Evidence references:** " + ", ".join(original["evidence_refs"]))
+    elif original.get("url"):
+        st.markdown(f"[Open source evidence]({original['url']})")
+    for commit_url in original.get("commit_urls", []):
+        st.markdown(f"[Open supporting commit]({commit_url})")
+
+    edited_title = st.text_input("Reviewed title", value=selected.get("edited_title", ""), key=f"review_title_{selected['review_id']}")
+    reviewer_note = st.text_area("Reviewer note", value=selected.get("reviewer_note", ""), key=f"review_note_{selected['review_id']}")
+    current_status = selected.get("status", "pending")
+    st.caption(f"Current decision: {current_status}")
+    approve_col, reject_col, pending_col = st.columns(3)
+    if approve_col.button("Approve finding", type="primary", key=f"approve_{selected['review_id']}"):
+        st.session_state["review_items"] = round3_engine.update_review_item(
+            review_items, selected["review_id"], status="approved",
+            edited_title=edited_title, reviewer_note=reviewer_note,
+        )
+        st.rerun()
+    if reject_col.button("Reject finding", key=f"reject_{selected['review_id']}"):
+        st.session_state["review_items"] = round3_engine.update_review_item(
+            review_items, selected["review_id"], status="rejected",
+            edited_title=edited_title, reviewer_note=reviewer_note,
+        )
+        st.rerun()
+    if pending_col.button("Reset to pending", key=f"pending_{selected['review_id']}"):
+        st.session_state["review_items"] = round3_engine.update_review_item(
+            review_items, selected["review_id"], status="pending",
+            edited_title=edited_title, reviewer_note=reviewer_note,
+        )
+        st.rerun()
+
+    approved = round3_engine.approved_findings(review_items)
+    st.write(f"**Approved findings:** {len(approved)} / {len(review_items)}")
+    role = st.selectbox(
+        "Handover audience", ["developer", "maintainer", "project_lead"],
+        format_func=lambda value: {
+            "developer": "Incoming developer",
+            "maintainer": "Repository maintainer",
+            "project_lead": "Project lead",
+        }[value], key="handover_role",
+    )
+    role_report = round3_engine.role_handover_report(
+        meta.get("full_name", "repository"), role, approved,
+        commits=commits, graph=graph, issues=issues, pulls=pulls,
+    )
+    st.download_button(
+        "Download approved role handover (Markdown)", role_report,
+        file_name=f"intenttrail_{role}_handover.md", mime="text/markdown",
+        key="role_handover_download",
+    )
+
+
 def render_app():
     st.set_page_config(page_title="IntentTrail", page_icon="🧭", layout="wide")
     st.title("🧭 IntentTrail")
@@ -613,6 +812,11 @@ def render_app():
                 meta, commits, issues, pulls = fetch(owner, repo)
                 findings = analyze(issues, pulls, commits)
             st.session_state["result"] = (meta, commits, issues, pulls, findings)
+            graph, intent_payload = _build_round3_context(meta, commits, issues, pulls)
+            st.session_state["round3_graph"] = graph
+            st.session_state["intent_payload"] = intent_payload
+            st.session_state["groq_result"] = None
+            st.session_state["review_items"] = round3_engine.make_review_items(findings)
             st.success(f"Analysis complete: {meta.get('full_name')}")
         except requests.exceptions.Timeout:
             st.error("GitHub request timed out. Try again.")
@@ -640,6 +844,40 @@ def render_app():
             f"Default branch: {meta.get('default_branch')} | "
             f"Stars: {meta.get('stargazers_count')} | Forks: {meta.get('forks_count')}"
         )
+
+        st.divider()
+        st.header("Round 3: Intent reconstruction and handover")
+        st.write(
+            "The rule-based analysis remains the baseline. Optional Groq analysis adds "
+            "evidence-linked hypotheses; relationship mapping and human approval work without Groq."
+        )
+        if st.button("Run optional Groq intent analysis", type="secondary", key="run_groq_analysis"):
+            with st.spinner("Preparing bounded repository evidence for Groq..."):
+                groq_result = round3_engine.analyze_with_groq(
+                    st.session_state["intent_payload"], api_key=os.getenv("GROQ_API_KEY")
+                )
+            st.session_state["groq_result"] = groq_result
+            if groq_result.get("status") == "success":
+                new_findings = [
+                    _hypothesis_to_finding(item)
+                    for item in groq_result.get("hypotheses", [])
+                ]
+                st.session_state["review_items"] = _append_review_items(
+                    st.session_state.get("review_items", []), new_findings
+                )
+        groq_result = st.session_state.get("groq_result")
+        if groq_result:
+            if groq_result.get("status") == "success":
+                st.success(groq_result.get("message", "Groq analysis completed."))
+                st.caption(f"Model: {groq_result.get('model') or 'Not reported'}")
+                if not groq_result.get("hypotheses"):
+                    st.info("No evidence-supported AI hypotheses were returned. Existing rule-based findings remain available.")
+            else:
+                st.warning(groq_result.get("message", "Groq is unavailable; rule-based analysis remains active."))
+        else:
+            st.caption("Groq has not been run. The application remains fully usable with rule-based analysis.")
+
+        _render_relationship_graph(st.session_state.get("round3_graph", {}))
 
         st.subheader("Potential unfinished work and work themes")
         st.warning("These are rule-based signals, not verified intentions. Human verification is required before sharing.")
@@ -685,6 +923,8 @@ def render_app():
                     _render_commit(commit)
         else:
             st.write("No commits returned.")
+
+        _render_human_review(meta, commits, st.session_state.get("round3_graph", {}), issues, pulls)
 
         st.download_button(
             "Download handover report (Markdown)",

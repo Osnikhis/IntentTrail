@@ -229,3 +229,38 @@ class GeneratedFileFilteringTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Round3IntegrationHelperTests(unittest.TestCase):
+    def test_round3_context_builds_graph_and_payload_without_patch_text(self):
+        meta = {"full_name": "acme/demo"}
+        commits = [{
+            "sha": "abc", "message": "Add login", "filenames": ["src/login.py"],
+            "patch": "+password=should-not-leak", "url": "https://github.com/acme/demo/commit/abc",
+        }]
+        graph, payload = app._build_round3_context(meta, commits, [], [])
+        self.assertEqual(len(graph["nodes"]), 1)
+        self.assertEqual(payload["repository"], "acme/demo")
+        self.assertNotIn("'patch':", repr(payload))
+        self.assertNotIn("should-not-leak", repr(payload))
+
+    def test_hypothesis_is_adapted_to_human_review_format(self):
+        finding = app._hypothesis_to_finding({
+            "title": "Authentication follow-up", "summary": "Review login changes.",
+            "evidence_refs": ["commit:abc"], "suggested_next_steps": ["Run auth tests."],
+            "human_review": "Human review required.",
+        })
+        self.assertEqual(finding["kind"], "AI-generated hypothesis")
+        self.assertEqual(finding["evidence_refs"], ["commit:abc"])
+        self.assertEqual(finding["suggested_next_steps"], ["Run auth tests."])
+
+    def test_appending_ai_review_does_not_reset_existing_decisions(self):
+        initial = app.round3_engine.make_review_items([{"kind": "Rule", "title": "Existing"}])
+        initial = app.round3_engine.update_review_item(
+            initial, initial[0]["review_id"], status="approved", reviewer_note="Verified"
+        )
+        updated = app._append_review_items(initial, [{"kind": "AI", "title": "New hypothesis"}])
+        self.assertEqual(updated[0]["status"], "approved")
+        self.assertEqual(updated[0]["reviewer_note"], "Verified")
+        self.assertEqual(len(updated), 2)
+        self.assertNotEqual(updated[0]["review_id"], updated[1]["review_id"])

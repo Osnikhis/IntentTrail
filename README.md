@@ -1,8 +1,9 @@
-# IntentTrail MVP
+# IntentTrail
 
-GitHub-first handover prototype for public repositories. It combines open issue/PR clues with recent commit-change evidence to help a maintainer begin a handover review.
+GitHub-first project handover prototype for public repositories. IntentTrail combines recent commit activity, open issues and pull requests, evidence-backed relationships, optional Groq-assisted intent hypotheses, and human-approved role-specific handovers.
 
 ## Setup (Windows PowerShell)
+
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
@@ -10,13 +11,32 @@ python -m pip install -r requirements.txt
 streamlit run app.py
 ```
 
-The app retrieves up to 30 recent commits and requests each commit's available details: author, date, changed filenames, additions/deletions, patch availability, and direct GitHub link. To keep the unauthenticated API workload bounded, it retrieves no more than those 30 details in one analysis. Commit detail failures and rate limits leave the summary visible and are identified in the app and report.
+## Round 3 features
 
-Related commits are grouped using shared filenames, parent directories, or non-generic words in commit messages. Commit messages and a bounded scan of added diff lines can surface simple follow-up markers such as `WIP`, `TODO`, or `FIXME`. Raw patch content is never displayed or included in the report; at most 12,000 patch characters per commit are scanned, and only marker names are retained.
+1. **ML-assisted intent reconstruction (optional):** Click **Run optional Groq intent analysis** to request cautious work-theme hypotheses. The model must cite exact evidence IDs, and the app rejects hypotheses without valid evidence references. Configure the free Groq API access with environment variables:
 
-All findings are rule-based possibilities, not verified intentions. Evidence includes supporting commit messages, filenames, and source links where available. A human maintainer must verify each finding before sharing. The app does not use a trained ML model or send repository contents to an AI service.
+   ```powershell
+   $env:GROQ_API_KEY="your-key-here"
+   $env:GROQ_MODEL="openai/gpt-oss-20b"
+   ```
 
-Run the focused checks with:
+   The API key is never stored in the source code. If the key is missing, invalid, rate-limited, the model is unavailable, the network fails, or the response is malformed, rule-based analysis remains available. No paid fallback is used.
+
+2. **Project relationship reconstruction:** IntentTrail links retrieved commits, issues and pull requests using shared filenames, directories, message keywords, and explicit GitHub references. These are evidence-backed associations, not proof of technical dependency or intent.
+
+3. **Role-specific human-approved handovers:** Review findings, edit their titles, add reviewer notes, and approve or reject them. Role-specific Markdown exports (developer, maintainer, project lead) include approved findings only.
+
+## Data handling and limitations
+
+- Public GitHub repositories only.
+- Up to 30 recent commits are summarized; issue and pull-request retrieval is bounded by the existing app implementation.
+- Raw patch text is not retained in commit summaries, displayed, included in model payloads, or included in reports. Diff scanning is bounded and retains marker names only.
+- Groq receives a compact, redacted metadata payload, not raw patches. Repository text is treated as untrusted evidence, not instructions.
+- Rule-based findings and model hypotheses are possibilities, not verified intentions. A human must review findings before sharing.
+- Relationship edges are navigational associations; shared paths or keywords do not establish a true dependency.
+
+## Tests
+
 ```powershell
 python -m unittest -v
 ```
