@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import os
 import re
@@ -214,9 +215,50 @@ def _summary_commit(commit, owner, repo, error):
     }
 
 
+def _fetch_readme(owner, repo):
+    """Fetch a bounded README excerpt; missing README must not block analysis."""
+    try:
+        response = requests.get(
+            f"{API}/repos/{owner}/{repo}/readme", headers=HEADERS, timeout=15
+        )
+        if response.status_code == 404:
+            return ""
+        response.raise_for_status()
+        payload = response.json()
+        encoded = payload.get("content", "")
+        if not encoded:
+            return ""
+        raw = base64.b64decode(encoded).decode("utf-8", errors="replace")
+        return raw[:8000]
+    except (requests.RequestException, ValueError, KeyError, TypeError):
+        return ""
+
+
+def _draft_project_goal(meta):
+    """Create an editable goal draft from README introduction or repo description."""
+    readme = meta.get("readme_text", "") or ""
+    readme = re.sub(r"```.*?```", " ", readme, flags=re.DOTALL)
+    readme = re.sub(r"!\[[^]]*\]\([^)]*\)", " ", readme)
+    readme = re.sub(r"\[([^]]+)\]\([^)]*\)", r"\1", readme)
+    candidates = []
+    for line in readme.splitlines():
+        line = line.strip().lstrip("#*-> ").strip()
+        if not line or line.startswith(("[!", "<", "|")):
+            continue
+        if len(line) < 35:
+            continue
+        candidates.append(line)
+        if len(candidates) >= 3:
+            break
+    if candidates:
+        return " ".join(candidates)[:1200]
+    return str(meta.get("description") or "")[:1200]
+
+
 def fetch(owner, repo):
     root = f"/repos/{owner}/{repo}"
     meta = api_get(root)
+    meta["readme_text"] = _fetch_readme(owner, repo)
     summary_commits = api_get(root + "/commits", {"per_page": COMMIT_LIMIT})
     raw_issues = api_get(root + "/issues", {"state": "all", "per_page": 100})
     issues = [item for item in raw_issues if "pull_request" not in item]
@@ -600,11 +642,12 @@ def _render_commit(commit):
 
 
 
-def _build_round3_context(meta, commits, issues, pulls):
+def _build_round3_context(meta, commits, issues, pulls, project_goal=""):
     """Build the evidence graph and bounded model payload for one repository run."""
     graph = round3_engine.build_relationship_graph(commits, issues, pulls)
     payload = round3_engine.build_intent_payload(
-        meta.get("full_name", ""), commits, issues, pulls, graph=graph
+        meta.get("full_name", ""), commits, issues, pulls, graph=graph,
+        project_goal=project_goal,
     )
     return graph, payload
 
@@ -723,6 +766,128 @@ def _render_relationship_graph(graph):
         st.caption(f"Limitation: {limitation}")
 
 
+
+def _render_reconstruction(reconstruction, payload):
+    if not reconstruction:
+        return
+    st.header("🧩 Reconstructed missing development intent")
+    st.write(reconstruction.get("likely_direction") or "No clear direction could be reconstructed.")
+    if reconstruction.get("current_state"):
+        st.markdown("**What the repository appears to contain now**")
+        st.write(reconstruction["current_state"])
+
+    evidence_by_id = {item.get("id"): item for item in payload.get("evidence", [])}
+
+    def show_refs(refs):
+        for ref in refs or []:
+            item = evidence_by_id.get(ref, {})
+            url = item.get("url", "")
+            label = ref
+            if item.get("title"):
+                label = f"{ref} — {item['title']}"
+            elif item.get("message"):
+                label = f"{ref} — {item['message'][:100]}"
+            if url.startswith("https://github.com/"):
+                st.markdown(f"- [{label}]({url})")
+            else:
+                st.markdown(f"- {label}")
+
+    gaps = reconstruction.get("missing_gaps", [])
+    if gaps:
+        st.markdown("**Possible missing pieces**")
+        for gap in gaps:
+            with st.container(border=True):
+                st.write(gap.get("description", ""))
+                show_refs(gap.get("evidence_refs"))
+
+    paths = reconstruction.get("next_paths", [])
+    if paths:
+        st.markdown("**Likely next development directions**")
+        for path in paths:
+            with st.container(border=True):
+                st.markdown(f"**{path.get('title', 'Possible next path')}** · {path.get('confidence', 'low').title()} model-assessed confidence")
+                st.write(path.get("reasoning", ""))
+                for step in path.get("suggested_next_steps", []):
+                    st.markdown(f"- {step}")
+                show_refs(path.get("evidence_refs"))
+    st.caption(reconstruction.get("disclaimer", "This is an evidence-backed hypothesis, not a verified intention."))
+    if paths:
+        st.caption("Confidence labels are qualitative model assessments, not calibrated probabilities.")
+
+
+def _render_next_work_path(commits, issues, pulls, graph, groq_result=None):
+    """Show ranked, evidence-linked recommendations as the primary product output."""
+    hypotheses = (groq_result or {}).get("hypotheses", []) if (groq_result or {}).get("status") == "success" else []
+    reconstruction = (groq_result or {}).get("reconstruction") or {}
+    for path in reconstruction.get("next_paths", []):
+        hypotheses.append({
+            "title": path.get("title", "Possible next path"),
+            "summary": path.get("reasoning", "Goal-aware path reconstructed from repository evidence."),
+            "suggested_next_steps": path.get("suggested_next_steps", []),
+            "evidence_refs": path.get("evidence_refs", []),
+        })
+    predictions = round3_engine.build_next_work_path(
+        commits, issues, pulls, graph=graph, hypotheses=hypotheses, limit=6
+    )
+    st.header("🧭 Predicted next work path")
+    st.write(
+        "A ranked set of plausible next actions informed by the project goal, reconstructed missing intent, "
+        "open GitHub work, follow-up markers, and linked repository activity."
+    )
+    st.caption(
+        "Priority scores are transparent heuristics, not probabilities. Every recommendation "
+        "needs developer verification; repository evidence cannot reveal private intent."
+    )
+    if not predictions:
+        st.info(
+            "No strong next-work signal was found in the retrieved commits, issues, or pull requests. "
+            "Inspect the latest changes and check branches or project discussions not included in this analysis."
+        )
+        return
+
+    report_lines = [
+        "# IntentTrail: Predicted next work path", "",
+        "> Priority scores are heuristic rankings, not probabilities. Verify all source evidence before acting.", "",
+    ]
+    for index, item in enumerate(predictions, 1):
+        report_lines.extend([
+            f"## {index}. {item['title']}", "",
+            f"- Category: {item['category']}",
+            f"- Priority: {item['priority_label']} ({item['priority_score']}/100)",
+            f"- Evidence basis: {item['basis']}", "", item['summary'], "",
+            "### Suggested next steps", *[f"- {step}" for step in item['suggested_next_steps']], "",
+            "### Source evidence", *[
+                f"- [{e.get('label') or e.get('id')}]({e.get('url')})" if e.get('url') else f"- {e.get('label') or e.get('id')}"
+                for e in item['evidence']
+            ], "", item['disclaimer'], "",
+        ])
+        with st.container(border=True):
+            left, right = st.columns([5, 1])
+            left.markdown(f"**{index}. {item['title']}**")
+            left.caption(f"{item['category']} · {item['priority_label']} priority")
+            right.metric("Priority", f"{item['priority_score']}/100")
+            st.write(item["summary"])
+            with st.expander("Why this is recommended and what to do next", expanded=(index == 1)):
+                st.write(f"**Evidence basis:** {item['basis']}")
+                st.write("**Suggested next steps**")
+                for step in item["suggested_next_steps"]:
+                    st.markdown(f"- {step}")
+                st.write("**Source evidence**")
+                for evidence in item["evidence"]:
+                    if evidence.get("url", "").startswith("https://github.com/"):
+                        st.markdown(f"- [{evidence.get('label') or evidence.get('id')}]({evidence['url']})")
+                    else:
+                        st.markdown(f"- {evidence.get('label') or evidence.get('id')}")
+                st.caption(item["disclaimer"])
+    st.download_button(
+        "Download predicted work path (Markdown)",
+        "\n".join(report_lines),
+        file_name="intenttrail_next_work_path.md",
+        mime="text/markdown",
+        key="next_work_path_download",
+    )
+
+
 def _render_human_review(meta, commits, graph, issues=None, pulls=None):
     review_items = st.session_state.get("review_items", [])
     st.subheader("Human review and role-specific handover")
@@ -798,8 +963,8 @@ def render_app():
     st.set_page_config(page_title="IntentTrail", page_icon="🧭", layout="wide")
     st.title("🧭 IntentTrail")
     st.subheader("Don't just inherit the code. Understand the journey behind it.")
-    st.write("GitHub-first project handover prototype: surface possible unfinished work with source evidence.")
-    st.info("Public GitHub repositories only. This MVP identifies signals; it does not claim to know a developer's intentions.")
+    st.write("Compare a project's intended goal with scattered repository evidence to reconstruct the missing development direction and predict what should happen next.")
+    st.info("Public GitHub repositories only. Intent reconstruction is an evidence-backed hypothesis, not access to a developer's private thoughts.")
 
     with st.form("repo_form"):
         url = st.text_input("Public GitHub repository URL", placeholder="https://github.com/owner/repo")
@@ -812,10 +977,12 @@ def render_app():
                 meta, commits, issues, pulls = fetch(owner, repo)
                 findings = analyze(issues, pulls, commits)
             st.session_state["result"] = (meta, commits, issues, pulls, findings)
+            st.session_state["project_goal_editor"] = _draft_project_goal(meta)
             graph, intent_payload = _build_round3_context(meta, commits, issues, pulls)
             st.session_state["round3_graph"] = graph
             st.session_state["intent_payload"] = intent_payload
             st.session_state["groq_result"] = None
+            st.session_state["goal_reconstruction_payload"] = None
             st.session_state["review_items"] = round3_engine.make_review_items(findings)
             st.success(f"Analysis complete: {meta.get('full_name')}")
         except requests.exceptions.Timeout:
@@ -848,36 +1015,88 @@ def render_app():
         st.divider()
         st.header("Round 3: Intent reconstruction and handover")
         st.write(
-            "The rule-based analysis remains the baseline. Optional Groq analysis adds "
-            "evidence-linked hypotheses; relationship mapping and human approval work without Groq."
+            "Start with the project's intended destination, then compare it with repository evidence "
+            "to reconstruct the likely missing development direction."
         )
-        if st.button("Run optional Groq intent analysis", type="secondary", key="run_groq_analysis"):
-            with st.spinner("Preparing bounded repository evidence for Groq..."):
-                groq_result = round3_engine.analyze_with_groq(
-                    st.session_state["intent_payload"], api_key=os.getenv("GROQ_API_KEY")
-                )
-            st.session_state["groq_result"] = groq_result
-            if groq_result.get("status") == "success":
-                new_findings = [
-                    _hypothesis_to_finding(item)
-                    for item in groq_result.get("hypotheses", [])
-                ]
-                st.session_state["review_items"] = _append_review_items(
-                    st.session_state.get("review_items", []), new_findings
-                )
+        st.subheader("1. Project goal / original problem statement")
+        st.caption("A draft is taken from the repository README or description. Correct it to match the original project goal before running reconstruction.")
+        if "project_goal_editor" not in st.session_state:
+            st.session_state["project_goal_editor"] = _draft_project_goal(meta)
+        project_goal = st.text_area(
+            "What is this project ultimately trying to achieve?",
+            key="project_goal_editor", height=110,
+            placeholder="Describe the original problem, intended outcome, or feature direction...",
+        )
+        if st.button("Reconstruct missing development intent", type="primary", key="run_groq_analysis"):
+            if not project_goal.strip():
+                st.warning("Add the project goal or problem statement first. You can use the README draft as a starting point.")
+            else:
+                with st.spinner("Comparing the project goal with repository evidence..."):
+                    goal_payload = round3_engine.build_intent_payload(
+                        meta.get("full_name", ""), commits, issues, pulls,
+                        graph=st.session_state.get("round3_graph", {}),
+                        project_goal=project_goal,
+                    )
+                    groq_result = round3_engine.analyze_with_groq(
+                        goal_payload, api_key=os.getenv("GROQ_API_KEY")
+                    )
+                st.session_state["intent_payload"] = goal_payload
+                st.session_state["groq_result"] = groq_result
+                st.session_state["goal_reconstruction_payload"] = goal_payload
+                if groq_result.get("status") == "success":
+                    new_findings = [
+                        _hypothesis_to_finding(item)
+                        for item in groq_result.get("hypotheses", [])
+                    ]
+                    reconstruction = groq_result.get("reconstruction") or {}
+                    if reconstruction.get("likely_direction") and reconstruction.get("evidence_refs"):
+                        new_findings.append(_hypothesis_to_finding({
+                            "title": "Reconstructed direction: " + reconstruction["likely_direction"][:120],
+                            "summary": reconstruction.get("current_state", ""),
+                            "evidence_refs": reconstruction.get("evidence_refs", []),
+                            "suggested_next_steps": [],
+                        }))
+                    for gap in reconstruction.get("missing_gaps", []):
+                        new_findings.append(_hypothesis_to_finding({
+                            "title": "Possible missing piece: " + gap.get("description", "")[:120],
+                            "summary": gap.get("description", ""),
+                            "evidence_refs": gap.get("evidence_refs", []),
+                        }))
+                    for path in reconstruction.get("next_paths", []):
+                        new_findings.append(_hypothesis_to_finding({
+                            "title": path.get("title", "Possible next path"),
+                            "summary": path.get("reasoning", ""),
+                            "evidence_refs": path.get("evidence_refs", []),
+                            "suggested_next_steps": path.get("suggested_next_steps", []),
+                        }))
+                    if new_findings:
+                        st.session_state["review_items"] = _append_review_items(
+                            st.session_state.get("review_items", []), new_findings
+                        )
         groq_result = st.session_state.get("groq_result")
         if groq_result:
             if groq_result.get("status") == "success":
-                st.success(groq_result.get("message", "Groq analysis completed."))
+                st.success(groq_result.get("message", "Intent reconstruction completed."))
                 st.caption(f"Model: {groq_result.get('model') or 'Not reported'}")
-                if not groq_result.get("hypotheses"):
-                    st.info("No evidence-supported AI hypotheses were returned. Existing rule-based findings remain available.")
+                if not groq_result.get("reconstruction"):
+                    st.info("The model did not return a reconstruction with verifiable evidence references. Check the goal and repository evidence, or try again later.")
+                _render_reconstruction(
+                    groq_result.get("reconstruction"),
+                    st.session_state.get("goal_reconstruction_payload", st.session_state.get("intent_payload", {})),
+                )
+                if not groq_result.get("hypotheses") and not groq_result.get("reconstruction"):
+                    st.info("No evidence-supported reconstruction or hypotheses were returned. Rule-based recommendations remain available.")
             else:
                 st.warning(groq_result.get("message", "Groq is unavailable; rule-based analysis remains active."))
         else:
-            st.caption("Groq has not been run. The application remains fully usable with rule-based analysis.")
+            st.caption("Intent reconstruction has not been run. Rule-based relationship mapping and next-work recommendations remain available.")
 
         _render_relationship_graph(st.session_state.get("round3_graph", {}))
+        _render_next_work_path(
+            commits, issues, pulls,
+            st.session_state.get("round3_graph", {}),
+            st.session_state.get("groq_result"),
+        )
 
         st.subheader("Potential unfinished work and work themes")
         st.warning("These are rule-based signals, not verified intentions. Human verification is required before sharing.")

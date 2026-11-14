@@ -50,6 +50,42 @@ class IntentPayloadTests(unittest.TestCase):
         self.assertEqual(result["status"], "fallback")
         self.assertEqual(result["hypotheses"], [])
 
+    def test_project_goal_is_included_in_bounded_payload(self):
+        payload = engine.build_intent_payload(
+            "x/y", [], [], [], project_goal="Build a beginner-friendly learning platform"
+        )
+        self.assertEqual(payload["project_goal"], "Build a beginner-friendly learning platform")
+
+    def test_reconstruction_rejects_unverified_evidence_references(self):
+        allowed = {"commit:abc", "issue:7"}
+        result = engine._validate_reconstruction({
+            "likely_direction": "Complete login validation",
+            "current_state": "Login exists",
+            "evidence_refs": ["commit:abc", "commit:invented"],
+            "missing_gaps": [
+                {"description": "Validation tests may be incomplete", "evidence_refs": ["issue:7"]},
+                {"description": "Unsupported claim", "evidence_refs": ["issue:999"]},
+            ],
+            "next_paths": [
+                {"title": "Add validation tests", "reasoning": "Issue is open",
+                 "confidence": "medium", "suggested_next_steps": ["Inspect test suite"],
+                 "evidence_refs": ["issue:7"]},
+                {"title": "Invented path", "evidence_refs": ["commit:fake"]},
+            ],
+        }, allowed)
+        self.assertEqual(result["evidence_refs"], ["commit:abc"])
+        self.assertEqual(len(result["missing_gaps"]), 1)
+        self.assertEqual(len(result["next_paths"]), 1)
+        self.assertEqual(result["next_paths"][0]["confidence"], "medium")
+
+    def test_reconstruction_without_any_valid_evidence_is_rejected(self):
+        result = engine._validate_reconstruction({
+            "likely_direction": "Complete payments",
+            "evidence_refs": ["commit:missing"],
+            "missing_gaps": [], "next_paths": [],
+        }, {"commit:real"})
+        self.assertIsNone(result)
+
 
 class GroqValidationTests(unittest.TestCase):
     @patch("round3_engine.requests.post")
@@ -57,13 +93,23 @@ class GroqValidationTests(unittest.TestCase):
         payload = engine.build_intent_payload(
             "x/y",
             [{"sha": "abc", "message": "Add login", "filenames": ["src/login.py"]}],
-            [], [],
+            [], [], project_goal="Build a secure sign-in experience",
         )
         valid_id = "commit:abc"
         response = Mock()
         response.status_code = 200
         response.json.return_value = {
             "choices": [{"message": {"content": json.dumps({
+                "reconstruction": {
+                    "likely_direction": "Complete authentication validation",
+                    "current_state": "Login code was added",
+                    "evidence_refs": [valid_id],
+                    "missing_gaps": [{"description": "Validation tests may be incomplete",
+                                      "evidence_refs": [valid_id, "issue:999"]}],
+                    "next_paths": [{"title": "Add auth tests", "reasoning": "Recent login work",
+                                    "confidence": "medium", "suggested_next_steps": ["Inspect tests"],
+                                    "evidence_refs": [valid_id]}],
+                },
                 "hypotheses": [
                     {"title": "Authentication work", "summary": "Related login changes.",
                      "suggested_next_steps": ["Review login tests."],
@@ -75,6 +121,9 @@ class GroqValidationTests(unittest.TestCase):
         result = engine.analyze_with_groq(payload, api_key="test-key")
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["hypotheses"][0]["evidence_refs"], [valid_id])
+        self.assertEqual(result["reconstruction"]["evidence_refs"], [valid_id])
+        self.assertEqual(len(result["reconstruction"]["missing_gaps"]), 1)
+        self.assertIn("Build a secure sign-in experience", post.call_args.kwargs["json"]["messages"][1]["content"])
 
     @patch("round3_engine.requests.post")
     def test_rate_limit_falls_back(self, post):
@@ -154,6 +203,60 @@ class HumanReviewTests(unittest.TestCase):
     def test_invalid_role_is_rejected(self):
         with self.assertRaises(ValueError):
             engine.role_handover_report("x/y", "intern", [])
+
+
+class NextWorkPathTests(unittest.TestCase):
+    def test_open_issue_becomes_high_priority_evidence_linked_task(self):
+        issues = [{"number": 12, "title": "Fix login validation", "state": "open",
+                   "html_url": "https://github.com/x/y/issues/12"}]
+        result = engine.build_next_work_path([], issues, [])
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["priority_label"], "High")
+        self.assertEqual(result[0]["evidence"][0]["id"], "issue:12")
+        self.assertIn("acceptance criteria", result[0]["suggested_next_steps"][-1])
+
+    def test_open_pull_request_is_ranked_above_model_hypothesis(self):
+        pulls = [{"number": 4, "title": "Add validation", "state": "open",
+                  "html_url": "https://github.com/x/y/pull/4"}]
+        commits = [{"sha": "abc", "message": "Authentication work", "url": "https://github.com/x/y/commit/abc"}]
+        hypotheses = [{"title": "Explore auth tests", "summary": "Possible test follow-up.",
+                       "suggested_next_steps": ["Inspect tests."], "evidence_refs": ["commit:abc"]}]
+        result = engine.build_next_work_path(commits, [], pulls, hypotheses=hypotheses)
+        self.assertEqual(result[0]["category"], "Open pull request")
+        self.assertEqual(result[1]["category"], "AI-assisted hypothesis")
+
+    def test_commit_follow_up_marker_creates_exploratory_task_with_source(self):
+        commits = [{"sha": "abc", "message": "WIP auth flow", "patch_markers": ["TODO"],
+                    "filenames": ["src/auth.py"], "url": "https://github.com/x/y/commit/abc"}]
+        result = engine.build_next_work_path(commits, [], [])
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["category"], "Possible unfinished work")
+        self.assertEqual(result[0]["evidence"][0]["url"], commits[0]["url"])
+
+    def test_related_commit_activity_produces_cautious_exploratory_path(self):
+        commits = [
+            {"sha": "a", "message": "Add login validation", "filenames": ["src/auth/login.py"],
+             "url": "https://github.com/x/y/commit/a"},
+            {"sha": "b", "message": "Improve login validation", "filenames": ["src/auth/login.py"],
+             "url": "https://github.com/x/y/commit/b"},
+        ]
+        graph = engine.build_relationship_graph(commits, [], [])
+        result = engine.build_next_work_path(commits, [], [], graph=graph)
+        self.assertTrue(any(item["category"] == "Related commit activity" for item in result))
+        item = next(item for item in result if item["category"] == "Related commit activity")
+        self.assertEqual(len(item["evidence"]), 2)
+        self.assertIn("does not prove", item["summary"])
+
+    def test_model_hypothesis_without_resolvable_evidence_is_excluded(self):
+        hypotheses = [{"title": "Unsupported", "evidence_refs": ["commit:not-real"]}]
+        result = engine.build_next_work_path([], [], [], hypotheses=hypotheses)
+        self.assertEqual(result, [])
+
+    def test_priority_is_not_described_as_probability(self):
+        issues = [{"number": 1, "title": "Bug", "state": "open",
+                   "html_url": "https://github.com/x/y/issues/1"}]
+        item = engine.build_next_work_path([], issues, [])[0]
+        self.assertIn("not a probability", item["disclaimer"])
 
 
 if __name__ == "__main__":
